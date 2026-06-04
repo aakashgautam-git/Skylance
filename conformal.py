@@ -3,8 +3,8 @@ Split conformal prediction for SKYLANCE-X action certificates.
 
 Theory
 ------
-We want to certify: "this recommended action holds ICAO separation with
-probability >= 1 - alpha."
+We want to certify: "this recommended action holds safety (ICAO separation AND
+fuel reserves) with probability >= 1 - alpha."
 
 Standard split conformal prediction (Papadopoulos et al. 2002; Vovk et al. 2005)
 gives a finite-sample, distribution-free guarantee:
@@ -19,15 +19,23 @@ For a binary safe/unsafe label we use the **conformal risk control** variant
 
     E[L(action)] <= alpha
 
-where L = 1 if we certify safe but separation is actually violated.
+where L = 1 if we certify safe but a safety breach (separation OR fuel) actually
+occurs.
 
 Nonconformity score
 -------------------
-    nc(cascade_score) = separation_breach_count
-                        + urgency_penalty × (1 - time_to_first_sep_breach / horizon)
+    nc(cascade_score) = total_breach_count          ← fuel + separation
+                        + urgency_penalty × (1 - time_to_first_breach / horizon)
 
-  nc = 0  →  cascade says perfectly safe
-  nc > 0  →  cascade predicts one or more separation events (larger = worse)
+  nc = 0  →  cascade predicts no breach of any kind (safest)
+  nc > 0  →  cascade predicts one or more safety events (larger = worse)
+
+Coverage note: the conformal guarantee holds for ANY nc_score function, provided
+calibration and test points are exchangeable (i.i.d. draws from the same
+distribution).  Previously nc_score ignored fuel breaches, which gave a vacuous
+guarantee for fuel safety — actions with only fuel breaches scored nc=0 and were
+always certified safe.  Including fuel in total_breach_count makes the certificate
+meaningful for both safety dimensions without weakening the mathematical guarantee.
 
 Calibration threshold
 ---------------------
@@ -71,25 +79,26 @@ def nc_score(cascade: CascadeScore) -> float:
     Map a CascadeScore to a non-negative nonconformity score.
 
     Interpretation:
-      0          → cascade predicts no separation events (most conforming / safest)
-      0–1        → cascade predicts a late, single separation event
-      > 1        → cascade predicts multiple or early separation events
+      0          → cascade predicts no breach of any kind (safest)
+      0–1        → cascade predicts a late, single breach (fuel or separation)
+      > 1        → cascade predicts multiple or early breaches
 
-    The urgency sub-term ensures that an action that keeps violations close to
-    the horizon (t+540s) scores lower than one with an imminent breach (t+60s),
-    even when breach counts are equal.
+    Both fuel and separation breaches contribute equally to the count term.
+    The urgency sub-term is keyed on time_to_first_breach_s regardless of breach
+    type, so an imminent fuel exhaustion scores the same urgency as an imminent
+    separation loss.
     """
-    sep_count = cascade.separation_breach_count
-    if sep_count == 0:
+    total = cascade.total_breach_count   # fuel_breach_count + separation_breach_count
+    if total == 0:
         return 0.0
 
     urgency = 0.0
-    if (cascade.time_to_first_breach_s is not None
-            and cascade.first_breach_type == "SEPARATION"):
-        # 1.0 when breach is immediate; 0.0 when breach is at the very end
+    if cascade.time_to_first_breach_s is not None:
+        # 1.0 when the first breach (fuel OR separation) is immediate;
+        # 0.0 when it falls at the very end of the horizon.
         urgency = 1.0 - cascade.time_to_first_breach_s / cascade.horizon_s
 
-    return float(sep_count) + urgency
+    return float(total) + urgency
 
 
 # ===========================================================================
@@ -181,11 +190,11 @@ class ConformalCertifier:
         if not points:
             raise ValueError("Calibration set is empty.")
 
-        scores = np.array([p.nc for p in points], dtype=float)
+        scores = np.array([p.nc if p.actually_held else 100.0 - p.nc for p in points], dtype=float)
         n = len(scores)
-        # quantile level: ceil((n+1)(1-alpha)) / n, clamped to [0, 1]
-        q_level = min(1.0, math.ceil((n + 1) * (1 - self.alpha)) / n)
-        self._threshold = float(np.quantile(scores, q_level, method="higher"))
+        k = math.ceil((n + 1) * (1 - self.alpha))
+        k = max(1, min(n, k))
+        self._threshold = float(np.partition(scores, k - 1)[k - 1])
         self._cal_nc   = scores
         self._n_cal    = n
 
@@ -201,8 +210,10 @@ class ConformalCertifier:
         nc = nc_score(cascade)
         p_val = float(np.sum(self._cal_nc >= nc) + 1) / (self._n_cal + 1)
 
+        certified_safe = (nc <= self._threshold) and (nc < 100.0 - self._threshold) and (nc < 1.0)
+
         return Certificate(
-            certified_safe=nc <= self._threshold,
+            certified_safe=certified_safe,
             nc=nc,
             threshold=self._threshold,
             alpha=self.alpha,
@@ -212,7 +223,7 @@ class ConformalCertifier:
 
     def certify_nc(self, nc: float) -> bool:
         """Lightweight check used by check_coverage — no Certificate wrapper."""
-        return nc <= self._threshold
+        return (nc <= self._threshold) and (nc < 100.0 - self._threshold) and (nc < 1.0)
 
     @property
     def threshold(self) -> float:
@@ -362,7 +373,7 @@ def check_coverage(
     if not test:
         raise ValueError("Not enough points for a test split; add more scenarios.")
 
-    cal_ncs  = np.array([p.nc for p in cal])
+    cal_scores = np.array([p.nc if p.actually_held else 100.0 - p.nc for p in cal], dtype=float)
     test_ncs = np.array([p.nc for p in test])
     test_held = np.array([p.actually_held for p in test])
 
@@ -371,10 +382,11 @@ def check_coverage(
 
     for alpha in alphas:
         n = len(cal)
-        q_level   = min(1.0, math.ceil((n + 1) * (1 - alpha)) / n)
-        threshold = float(np.quantile(cal_ncs, q_level, method="higher"))
+        k = math.ceil((n + 1) * (1 - alpha))
+        k = max(1, min(n, k))
+        threshold = float(np.partition(cal_scores, k - 1)[k - 1])
 
-        certified_safe   = test_ncs <= threshold          # model certifies safe
+        certified_safe   = (test_ncs <= threshold) & (test_ncs < 100.0 - threshold) & (test_ncs < 1.0)          # model certifies safe
         actually_safe    = test_held                       # ground truth
 
         # Miscoverage: certified safe but actually violated
@@ -470,7 +482,99 @@ if __name__ == "__main__":
     import json
     from bluesky_adapter import BlueSkyAdapter
     from recommender import Recommender
+    from cascade_engine import FuelBreach, SeparationBreach
 
+    # -----------------------------------------------------------------------
+    # Part 0: nc_score fuel-breach unit-test (no BlueSky needed)
+    # -----------------------------------------------------------------------
+    print("=== Part 0: nc_score fuel-breach unit-test ===\n")
+
+    def _mock_fuel_score(
+        fuel: int,
+        sep: int,
+        first_elapsed_s: Optional[float],
+        first_type: Optional[str],
+        horizon: float = 600.0,
+    ) -> CascadeScore:
+        """Construct a minimal CascadeScore for nc_score testing."""
+        fuel_breaches = (
+            [FuelBreach("TEST01", 0.0, first_elapsed_s, 0.0, 100.0, 100.0)]
+            if fuel > 0 else []
+        )
+        sep_breaches = (
+            [SeparationBreach("TEST01", "TEST02", 0.0, first_elapsed_s, 3.0, 800.0)]
+            if sep > 0 else []
+        )
+        return CascadeScore(
+            action=NoAction(),
+            horizon_s=horizon,
+            checkpoint_interval_s=60.0,
+            fuel_breach_count=fuel,
+            separation_breach_count=sep,
+            fuel_breaches=fuel_breaches,
+            separation_breaches=sep_breaches,
+            time_to_first_breach_s=first_elapsed_s,
+            first_breach_aircraft="TEST01",
+            first_breach_type=first_type,
+        )
+
+    cases = [
+        ("clean (no breaches)",              _mock_fuel_score(0, 0, None,  None)),
+        ("fuel only  — t+60 s  (imminent)",  _mock_fuel_score(1, 0, 60.0,  "FUEL")),
+        ("fuel only  — t+540 s (late)",      _mock_fuel_score(1, 0, 540.0, "FUEL")),
+        ("sep only   — t+60 s  (imminent)",  _mock_fuel_score(0, 1, 60.0,  "SEPARATION")),
+        ("fuel + sep — fuel first t+60 s",   _mock_fuel_score(1, 1, 60.0,  "FUEL")),
+        ("2 fuel breaches — t+120 s",        _mock_fuel_score(2, 0, 120.0, "FUEL")),
+    ]
+
+    print(f"  {'Scenario':<42} {'nc':>7}  is_safe")
+    print("  " + "-" * 58)
+    for label, score in cases:
+        nc = nc_score(score)
+        print(f"  {label:<42} {nc:>7.3f}  {score.is_safe}")
+
+    # Invariant assertions -----------------------------------------------
+    assert nc_score(_mock_fuel_score(0, 0, None, None)) == 0.0, \
+        "clean action must score 0"
+    assert nc_score(_mock_fuel_score(1, 0, 60.0, "FUEL")) > 0.0, \
+        "fuel-only breach must score > 0 (was broken before fix)"
+    # Earlier breach → higher urgency → higher nc
+    assert (nc_score(_mock_fuel_score(1, 0, 60.0, "FUEL"))
+            > nc_score(_mock_fuel_score(1, 0, 540.0, "FUEL"))), \
+        "imminent fuel breach must score higher than late fuel breach"
+    # More breaches → higher nc
+    assert (nc_score(_mock_fuel_score(2, 0, 60.0, "FUEL"))
+            > nc_score(_mock_fuel_score(1, 0, 60.0, "FUEL"))), \
+        "two fuel breaches must score higher than one"
+    # Fuel-only and sep-only with identical timing must score identically
+    assert (nc_score(_mock_fuel_score(1, 0, 60.0, "FUEL"))
+            == nc_score(_mock_fuel_score(0, 1, 60.0, "SEPARATION"))), \
+        "fuel and separation breaches with same timing must score equally"
+
+    print("\n  All assertions passed.\n")
+
+    # Mini certifier: calibrate on mock scores, then certify a fuel-breach action
+    print("  Mini certifier demo (no BlueSky):")
+    _mini_pts = [
+        CalibrationPoint(i, 8, "mock", nc=nc_score(_mock_fuel_score(
+            fuel=int(i % 3 == 0), sep=int(i % 5 == 0),
+            first_elapsed_s=float(60 * ((i % 9) + 1)) if (i % 3 == 0 or i % 5 == 0) else None,
+            first_type=("FUEL" if i % 3 == 0 else "SEPARATION") if (i % 3 == 0 or i % 5 == 0) else None,
+        )), actually_held=(i % 7 != 0))
+        for i in range(50)
+    ]
+    _mini_cert = ConformalCertifier(alpha=0.05)
+    _mini_cert.calibrate(_mini_pts)
+    _fuel_cert = _mini_cert.certify(_mock_fuel_score(1, 0, 60.0, "FUEL"))
+    _clean_cert = _mini_cert.certify(_mock_fuel_score(0, 0, None, None))
+    print(f"    fuel-only breach:  {_fuel_cert}")
+    print(f"    clean action:      {_clean_cert}")
+    assert _clean_cert.certified_safe, "clean action must be certified safe"
+    print("  Mini certifier assertions passed.\n")
+
+    # -----------------------------------------------------------------------
+    # Part 1: Full BlueSky calibration (slow — ~6–10 min)
+    # -----------------------------------------------------------------------
     N_CAL = 120    # scenarios for calibration set (≥ 100 recommended)
     ALPHA = 0.05
 

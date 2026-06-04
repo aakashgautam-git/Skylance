@@ -1,0 +1,48 @@
+# SKYLANCE-X — Python dependencies
+#
+# BlueSky is BUNDLED in the bluesky/ subdirectory; do NOT install
+# bluesky-simulator or bluesky-navdata from PyPI — they are already on sys.path
+# via the local directory.  The packages below cover SKYLANCE-X's direct
+# imports plus all of BlueSky's runtime deps (from bluesky/pyproject.toml).
+#
+# Requires Python >= 3.10 (BlueSky constraint).
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# Headless / server use (no Qt, no pygame, no textual):
+#   The GUI optional-deps from BlueSky's pyproject.toml (PyQt6, pygame,
+#   textual) are intentionally excluded — BlueSky is started with
+#   bs.init(mode='sim', detached=True) and never opens a window.
+
+# ── SKYLANCE-X direct deps ────────────────────────────────────────────────────
+
+# Dashboard UI
+streamlit>=1.30,<2.0
+
+# Radar & chart visualisation (app.py: plotly.graph_objects)
+plotly>=5.18,<6.0
+
+# Numerical core (conformal.py, baseline.py)
+# Upper bound matches BlueSky's own constraint (bluesky/pyproject.toml: numpy<2.4.0)
+numpy>=1.24,<2.4
+
+# Optional — RFBaseline in baseline.py; code falls back to GreedyBaseline gracefully
+# if sklearn is absent, so this can be omitted for pure cascade/conformal use.
+scikit-learn>=1.3
+
+# ── BlueSky runtime deps (bluesky/pyproject.toml) ────────────────────────────
+
+# Scientific stack used internally by BlueSky's performance/atmosphere models
+scipy>=1.10
+matplotlib>=3.7
+pandas>=2.0
+
+# IPC / messaging layer used by BlueSky's stack & event bus
+msgpack>=1.0.0
+pyzmq>=24.0          # imported as "zmq" — package name on PyPI is pyzmq
+
+# OpenAP aircraft performance model (fuel flow, drag, thrust)
+# ? version range: openap 2.x is the current series; 1.x API changed significantly.
+#   Tested with 2.4 (installed on this machine).  Pin accordingly if breakage occurs.
+openap>=2.0

@@ -65,10 +65,11 @@ _LABEL_NAMES = ["NoAction", "AssignRunway", "Hold", "Vector"]
 # Airport coordinates for nearest-runway selection.
 # Must stay in sync with app.py's _AIRPORTS.
 _RUNWAY_COORDS: dict[str, tuple[float, float]] = {
-    '27L': (51.4700, -0.4543),   # EGLL — London Heathrow
-    '27R': (51.4700, -0.4543),
-    '09L': (52.3086,  4.7639),   # EHAM — Amsterdam Schiphol
-    '09R': (52.3086,  4.7639),
+    '09R': (13.20, 77.71),  '27L': (13.20, 77.71),   # VOBL Bengaluru
+    '09':  (19.09, 72.87),  '27':  (19.09, 72.87),   # VABB Mumbai
+    '10':  (28.56, 77.10),  '28':  (28.56, 77.10),   # VIDP Delhi
+    '07':  (12.99, 80.17),  '25':  (12.99, 80.17),   # VOMM Chennai
+    '09L': (17.24, 78.43),  '27R': (17.24, 78.43),   # VOHS Hyderabad
 }
 
 

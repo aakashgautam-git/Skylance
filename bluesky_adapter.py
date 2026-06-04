@@ -65,6 +65,7 @@ class BlueSkyAdapter:
         self._emergency_flag: dict[str, bool] = {}
         self._emergency_type: dict[str, Optional[str]] = {}
         self._runway_needed: dict[str, Optional[str]] = {}
+        self._vertical_speed_fpm: dict[str, float] = {}
         self._runway_availability: dict[str, bool] = {}
 
     # -----------------------------------------------------------------------
@@ -84,8 +85,15 @@ class BlueSkyAdapter:
         bs.stack.stack('DEL ALL')
         # DEL ALL is queued asynchronously; drain any remaining aircraft
         # directly by index (delete(0) reindexes, so looping from front is safe).
-        while bs.traf.ntraf > 0:
-            bs.traf.delete(0)
+        # delete(0) reindexes after each removal; guard with try/except so a
+        # size-0 array (e.g. from a prior async DEL ALL) never raises IndexError.
+        _guard = 0
+        while bs.traf.ntraf > 0 and _guard < 500:
+            try:
+                bs.traf.delete(0)
+            except (IndexError, ValueError):
+                break
+            _guard += 1
         bs.stack.stack('CDMETHOD STATEBASED')
 
         self._fuel_kg.clear()
@@ -95,6 +103,7 @@ class BlueSkyAdapter:
         self._emergency_flag.clear()
         self._emergency_type.clear()
         self._runway_needed.clear()
+        self._vertical_speed_fpm.clear()
 
         for ac in sector.aircraft:
             bs.traf.cre(
@@ -113,6 +122,7 @@ class BlueSkyAdapter:
             self._emergency_flag[ac.id]       = ac.emergency_flag
             self._emergency_type[ac.id]       = ac.emergency_type
             self._runway_needed[ac.id]        = ac.runway_needed
+            self._vertical_speed_fpm[ac.id]   = ac.vertical_speed_fpm
 
         self._runway_availability = dict(sector.runway_availability)
 
@@ -154,6 +164,7 @@ class BlueSkyAdapter:
                 emergency_flag=self._emergency_flag.get(acid, False),
                 emergency_type=self._emergency_type.get(acid),
                 runway_needed=self._runway_needed.get(acid),
+                vertical_speed_fpm=self._vertical_speed_fpm.get(acid, 0.0),
             ))
         return SectorState(
             aircraft=aircraft,

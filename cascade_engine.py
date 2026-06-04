@@ -166,26 +166,51 @@ def _advance_state(state: SectorState, dt_s: float) -> SectorState:
     """
     Dead-reckon all aircraft forward by dt_s seconds.
 
-    Position update uses a spherical-Earth flat approximation with
-    cos(lat) longitude correction — error < 0.1 nm over a 10-min horizon
-    at 450 kt, negligible against the 5 nm separation minimum.
+    Horizontal position:
+        Each aircraft's airspeed (ground_speed_kt along heading) is resolved
+        into north/east components, then the sector wind vector is added to
+        give the actual ground-track displacement:
+
+            track_north_kt = airspeed * cos(hdg) + wind_north_kt
+            track_east_kt  = airspeed * sin(hdg) + wind_east_kt
+
+        Positions are then updated using the flat-earth / cos(lat) correction.
+        Error < 0.1 nm over a 10-min horizon at 450 kt — negligible against the
+        5 nm separation minimum.  When wind is (0, 0) the formula is identical
+        to the previous scalar-distance form.
+
+    Altitude:
+        Constant-rate model: altitude_ft += vertical_speed_fpm * (dt_s / 60),
+        clamped to 0 ft.  The updated altitude feeds directly into
+        _check_separation so the 1000 ft vertical test uses projected values.
+
+    Wind:
+        The wind vector is held constant throughout the lookahead and propagated
+        unchanged into the returned SectorState.
     """
+    dt_hr   = dt_s / 3600.0
+    wind_n  = state.wind_north_kt
+    wind_e  = state.wind_east_kt
+
     new_aircraft = []
     for ac in state.aircraft:
         hdg_rad = math.radians(ac.heading_deg)
         lat_rad = math.radians(ac.lat)
-        dist_nm = ac.ground_speed_kt * (dt_s / 3600.0)
 
-        new_lat = ac.lat + dist_nm * math.cos(hdg_rad) * _NM_IN_DEG_LAT
+        track_n = ac.ground_speed_kt * math.cos(hdg_rad) + wind_n
+        track_e = ac.ground_speed_kt * math.sin(hdg_rad) + wind_e
         cos_lat = math.cos(lat_rad)
-        new_lon = ac.lon + dist_nm * math.sin(hdg_rad) * _NM_IN_DEG_LAT / max(cos_lat, 1e-9)
+
+        new_lat  = ac.lat + track_n * dt_hr * _NM_IN_DEG_LAT
+        new_lon  = ac.lon + track_e * dt_hr * _NM_IN_DEG_LAT / max(cos_lat, 1e-9)
         new_fuel = max(0.0, ac.fuel_kg - ac.fuel_burn_rate_kg_per_min * (dt_s / 60.0))
+        new_alt  = max(0.0, ac.altitude_ft + ac.vertical_speed_fpm * (dt_s / 60.0))
 
         new_aircraft.append(AircraftState(
             id=ac.id,
             lat=new_lat,
             lon=new_lon,
-            altitude_ft=ac.altitude_ft,
+            altitude_ft=new_alt,
             heading_deg=ac.heading_deg,
             ground_speed_kt=ac.ground_speed_kt,
             fuel_kg=new_fuel,
@@ -194,12 +219,15 @@ def _advance_state(state: SectorState, dt_s: float) -> SectorState:
             emergency_flag=ac.emergency_flag,
             emergency_type=ac.emergency_type,
             runway_needed=ac.runway_needed,
+            vertical_speed_fpm=ac.vertical_speed_fpm,
         ))
 
     return SectorState(
         aircraft=new_aircraft,
         runway_availability=dict(state.runway_availability),
         sim_time_s=state.sim_time_s + dt_s,
+        wind_north_kt=wind_n,
+        wind_east_kt=wind_e,
     )
 
 
@@ -380,6 +408,8 @@ def _apply_action(sector: SectorState, action: CandidateAction) -> SectorState:
         aircraft=aircraft,
         runway_availability=runway_availability,
         sim_time_s=sector.sim_time_s,
+        wind_north_kt=sector.wind_north_kt,
+        wind_east_kt=sector.wind_east_kt,
     )
 
 
@@ -398,6 +428,7 @@ def _copy_ac(ac: AircraftState) -> AircraftState:
         emergency_flag=ac.emergency_flag,
         emergency_type=ac.emergency_type,
         runway_needed=ac.runway_needed,
+        vertical_speed_fpm=ac.vertical_speed_fpm,
     )
 
 

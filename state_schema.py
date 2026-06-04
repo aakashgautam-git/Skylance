@@ -27,6 +27,7 @@ class AircraftState:
     emergency_flag: bool             # True if any emergency is active
     emergency_type: Optional[str]    # e.g. "MAYDAY", "PAN-PAN", "FUEL", "MED", None
     runway_needed: Optional[str]     # e.g. "27L", None if not requesting priority
+    vertical_speed_fpm: float = 0.0  # ft/min; negative = descending, 0 = cruise
 
     # ------------------------------------------------------------------
     # Derived convenience properties
@@ -74,6 +75,7 @@ class AircraftState:
             emergency_flag=d["emergency_flag"],
             emergency_type=d.get("emergency_type"),
             runway_needed=d.get("runway_needed"),
+            vertical_speed_fpm=d.get("vertical_speed_fpm", 0.0),
         )
 
 
@@ -82,6 +84,8 @@ class SectorState:
     aircraft: list[AircraftState]
     runway_availability: dict[str, bool]  # runway_id -> available
     sim_time_s: float                     # simulation elapsed time, seconds
+    wind_north_kt: float = 0.0            # wind velocity northward (kt); positive = from south
+    wind_east_kt: float = 0.0             # wind velocity eastward (kt); positive = from west
 
     # ------------------------------------------------------------------
     # Serialization
@@ -92,6 +96,8 @@ class SectorState:
             "aircraft": [a.to_dict() for a in self.aircraft],
             "runway_availability": self.runway_availability,
             "sim_time_s": self.sim_time_s,
+            "wind_north_kt": self.wind_north_kt,
+            "wind_east_kt": self.wind_east_kt,
         }
 
     @classmethod
@@ -100,6 +106,8 @@ class SectorState:
             aircraft=[AircraftState.from_dict(a) for a in d["aircraft"]],
             runway_availability=d["runway_availability"],
             sim_time_s=d["sim_time_s"],
+            wind_north_kt=d.get("wind_north_kt", 0.0),
+            wind_east_kt=d.get("wind_east_kt", 0.0),
         )
 
 
@@ -108,9 +116,10 @@ class SectorState:
 # ---------------------------------------------------------------------------
 
 _AIRCRAFT_TYPES = ["A320", "B738", "A321", "B77W", "A333", "E190"]
-_CALLSIGN_PREFIXES = ["BAW", "KLM", "DLH", "AFR", "UAE", "SWR", "IBE", "TAP"]
+_CALLSIGN_PREFIXES = ["AIC", "IGO", "SEJ", "VTI", "BSK", "SAB", "STR", "AIX"]
 _EMERGENCY_TYPES = ["MAYDAY", "PAN-PAN", "FUEL", "MED", None, None, None, None]
-_RUNWAYS = ["27L", "27R", "09L", "09R"]
+# Indian airport runways: VOBL(BLR), VABB(BOM), VIDP(DEL), VOMM(MAA), VOHS(HYD)
+_RUNWAYS = ["09R", "27L", "09", "27", "10", "28", "07", "25", "09L", "27R"]
 
 
 def make_mock_sector(n: int = 12, seed: int = 42) -> SectorState:
@@ -148,21 +157,26 @@ def make_mock_sector(n: int = 12, seed: int = 42) -> SectorState:
             emergency_type = "FUEL"
             emergency_flag = True
             runway_needed = rng.choice(_RUNWAYS)
+            # Descending to land: -800 to -1500 fpm
+            vs_fpm = round(rng.uniform(-1500, -800), 1)
         elif is_emergency:
             fuel_kg = reserve + burn_rate * rng.uniform(45, 90)
             emergency_type = rng.choice(["MAYDAY", "PAN-PAN", "MED"])
             emergency_flag = True
             runway_needed = rng.choice(_RUNWAYS)
+            # Descending to land: -400 to -1200 fpm
+            vs_fpm = round(rng.uniform(-1200, -400), 1)
         else:
             fuel_kg = reserve + burn_rate * rng.uniform(60, 240)
             emergency_type = None
             emergency_flag = False
             runway_needed = None
+            vs_fpm = 0.0  # cruise level
 
         aircraft.append(AircraftState(
             id=make_callsign(),
-            lat=rng.uniform(51.0, 53.5),
-            lon=rng.uniform(3.0, 7.5),
+            lat=rng.uniform(13.0, 28.5),   # Indian subcontinent airspace
+            lon=rng.uniform(72.5, 81.0),
             altitude_ft=float(alt_ft),
             heading_deg=rng.uniform(0, 360),
             ground_speed_kt=rng.uniform(380, 480),
@@ -172,6 +186,7 @@ def make_mock_sector(n: int = 12, seed: int = 42) -> SectorState:
             emergency_flag=emergency_flag,
             emergency_type=emergency_type,
             runway_needed=runway_needed,
+            vertical_speed_fpm=vs_fpm,
         ))
 
     runway_availability = {rwy: rng.random() > 0.15 for rwy in _RUNWAYS}

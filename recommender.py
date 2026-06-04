@@ -35,6 +35,16 @@ _EARTH_R_M = 6_371_000.0
 
 MAX_CANDIDATES = 20          # hard cap on candidate set size
 _CLOSE_PAIR_THRESHOLD_NM = 20.0  # pairs within this range get vector candidates
+_PRIORITY_APPROACH_RADIUS_NM = 80.0  # aircraft within this radius of target airport get held
+
+# Runway → (lat, lon) for nearest-airport selection.  Synced with app.py _AIRPORTS.
+_RUNWAY_LOCS: dict[str, tuple[float, float]] = {
+    '09R': (13.20, 77.71),  '27L': (13.20, 77.71),   # VOBL Bengaluru
+    '09':  (19.09, 72.87),  '27':  (19.09, 72.87),   # VABB Mumbai
+    '10':  (28.56, 77.10),  '28':  (28.56, 77.10),   # VIDP Delhi
+    '07':  (12.99, 80.17),  '25':  (12.99, 80.17),   # VOMM Chennai
+    '09L': (17.24, 78.43),  '27R': (17.24, 78.43),   # VOHS Hyderabad
+}
 
 
 # ===========================================================================
@@ -52,6 +62,7 @@ class RewardWeights:
     time_gain:           float = 0.5     # per second of additional margin gained
     emergency_bonus:     float = 120.0   # action targets an emergency aircraft
     fuel_critical_bonus: float = 80.0    # action targets a fuel-critical aircraft
+    mayday_bonus:        float = 400.0   # AssignRunway to a MAYDAY aircraft (dominates)
     hold_kt_penalty:     float = 0.08    # per kt·minute of speed reduction
     vector_deg_penalty:  float = 0.8     # per degree of heading deviation
 
@@ -101,13 +112,15 @@ def enumerate_candidates(
       1. NoAction  (always first — establishes baseline)
       2. Runway assignments for emergency and fuel-critical aircraft
          (all {aircraft} × {available runways} combinations)
-      3. Runway swap pairs  — reassign one aircraft to the runway another
-         currently holds, breaking tie for priority approach slot
+      3. Runway swap pairs  — when two emergencies compete for the same
+         runway, redirect the lower-urgency one to an uncontested slot
       4. Hold actions for non-critical aircraft (those with most fuel margin)
       5. Vector actions ±30° / ±60° for the lower-priority member of each
          close pair
     """
     candidates: list[CandidateAction] = [NoAction()]
+    if len(candidates) >= max_candidates:
+        return candidates
     available_runways = [r for r, ok in sector.runway_availability.items() if ok]
     by_urgency = sorted(sector.aircraft, key=_urgency)
 
@@ -128,6 +141,33 @@ def enumerate_candidates(
         candidates.append(c)
         return len(candidates) >= max_candidates
 
+    # --- 0. MAYDAY priority approach — nearest open runway + clear the path --
+    # This step runs before general emergency handling so the nearest-runway
+    # assignment is always the first non-NoAction candidate.
+    mayday_acs = [ac for ac in by_urgency
+                  if ac.emergency_flag and ac.emergency_type == "MAYDAY"]
+    for ac in mayday_acs:
+        if not available_runways:
+            continue
+        # Nearest open runway by airport great-circle distance
+        nearest_rwy = min(
+            available_runways,
+            key=lambda r: _haversine_m(
+                ac.lat, ac.lon, *_RUNWAY_LOCS.get(r, (ac.lat, ac.lon))
+            ),
+        )
+        if _add(AssignRunwayAction(ac.id, nearest_rwy)):
+            return candidates
+        # Hold non-emergency aircraft within approach radius of target airport
+        ap_lat, ap_lon = _RUNWAY_LOCS.get(nearest_rwy, (ac.lat, ac.lon))
+        for other in sector.aircraft:
+            if other.id == ac.id or other.emergency_flag or other.is_fuel_critical:
+                continue
+            if (_haversine_m(other.lat, other.lon, ap_lat, ap_lon) / _NM_TO_M
+                    < _PRIORITY_APPROACH_RADIUS_NM):
+                if _add(HoldAction(other.id)):
+                    return candidates
+
     # --- 1. Greedy runway assignments for priority aircraft ------------------
     for ac in by_urgency:
         if ac.emergency_flag or ac.is_fuel_critical:
@@ -135,21 +175,24 @@ def enumerate_candidates(
                 if _add(AssignRunwayAction(ac.id, rwy)):
                     return candidates
 
-    # --- 2. Runway swaps: pair each needy aircraft with another's runway -----
-    # A "swap" here means: give aircraft A the runway that aircraft B wants,
-    # forcing B to accept a different slot.  This can resolve a priority conflict
-    # when two emergencies both want the same runway.
+    # --- 2. Runway swaps: when two emergency aircraft compete for the same
+    #        runway, redirect the lower-urgency one to an uncontested slot.
+    # `occupied` = runways already declared as runway_needed by any needy
+    # aircraft.  We never redirect onto an occupied runway — that shifts the
+    # conflict rather than resolving it.
     needy = [ac for ac in by_urgency if ac.runway_needed and ac.emergency_flag]
+    occupied = {ac.runway_needed for ac in needy}
     for i in range(len(needy)):
         for j in range(i + 1, len(needy)):
-            a, b = needy[i], needy[j]
+            a, b = needy[i], needy[j]   # a has higher urgency (earlier in by_urgency)
             if a.runway_needed != b.runway_needed:
-                # Give a the runway b currently holds (and vice versa)
-                if b.runway_needed in available_runways:
-                    if _add(AssignRunwayAction(a.id, b.runway_needed)):
-                        return candidates
-                if a.runway_needed in available_runways:
-                    if _add(AssignRunwayAction(b.id, a.runway_needed)):
+                continue  # different runways — no contention to resolve
+            # Both a and b are competing for the same runway.
+            # a has higher urgency so a keeps it; redirect b to any available
+            # runway that no other needy aircraft is already competing for.
+            for rwy in available_runways:
+                if rwy not in occupied:
+                    if _add(AssignRunwayAction(b.id, rwy)):
                         return candidates
 
     # --- 3. Hold actions for non-critical aircraft (most fuel = safest to hold)
@@ -216,6 +259,10 @@ def compute_reward(
                 fairness += weights.emergency_bonus
             if target.is_fuel_critical:
                 fairness += weights.fuel_critical_bonus
+            # MAYDAY priority-approach bonus dominates all other reward terms
+            if (target.emergency_type == "MAYDAY"
+                    and isinstance(action, AssignRunwayAction)):
+                fairness += weights.mayday_bonus
 
     # --- Efficiency ---
     efficiency = 0.0
@@ -384,6 +431,30 @@ if __name__ == "__main__":
 
     print(f"\nEnumerating candidates (max {MAX_CANDIDATES})...")
     candidates = enumerate_candidates(sector)
+
+    # --- Candidate correctness assertions ------------------------------------
+    _open_rwys = {r for r, ok in sector.runway_availability.items() if ok}
+    _seen_keys: set[tuple] = set()
+    for _c in candidates:
+        if isinstance(_c, NoAction):
+            _key: tuple = ("NoAction",)
+        elif isinstance(_c, AssignRunwayAction):
+            assert _c.runway_id in sector.runway_availability, (
+                f"Unknown runway {_c.runway_id!r} in candidate")
+            assert sector.runway_availability[_c.runway_id], (
+                f"Candidate assigns {_c.aircraft_id} to closed runway {_c.runway_id!r}")
+            _key = ("AssignRunwayAction", _c.aircraft_id, _c.runway_id)
+        elif isinstance(_c, HoldAction):
+            _key = ("HoldAction", _c.aircraft_id)
+        elif isinstance(_c, VectorAction):
+            _key = ("VectorAction", _c.aircraft_id, round(_c.new_heading_deg, 1))
+        else:
+            _key = (type(_c).__name__,)
+        assert _key not in _seen_keys, f"Duplicate candidate: {_key}"
+        _seen_keys.add(_key)
+    print(f"  Assertions passed: {len(candidates)} candidates, "
+          f"0 closed-runway assignments, 0 duplicates.")
+
     for i, c in enumerate(candidates):
         print(f"  [{i:2d}] {type(c).__name__:<22} "
               f"{getattr(c, 'aircraft_id', ''):<8} "
@@ -399,3 +470,65 @@ if __name__ == "__main__":
     top3 = rec.recommend_top_k(sector, k=3)
     for i, r in enumerate(top3, 1):
         print(f"  #{i}  reward={r.reward:+.1f}  {r.action_type}  {r.improvement_summary}")
+
+    # --- Swap-logic targeted test -------------------------------------------
+    # Two emergencies both want 27L; only 27R and 09L are uncontested open slots.
+    # Swap step must redirect EMG002 (lower urgency) to 27R or 09L only —
+    # never to 27L (contested) or 09R (closed).
+    print("\n=== Swap-logic targeted test ===")
+    from state_schema import AircraftState, SectorState as _SS
+
+    _swap_sector = _SS(
+        aircraft=[
+            AircraftState("EMG001", 52.0, 4.0, 30000, 90,  450,
+                          2500.0, 10.0, 2200.0, True,  "MAYDAY",   "27L"),
+            AircraftState("EMG002", 52.5, 4.5, 32000, 270, 420,
+                          2800.0,  9.0, 2100.0, True,  "PAN-PAN",  "27L"),
+            AircraftState("NRM001", 51.8, 4.8, 34000, 180, 430,
+                          6000.0, 11.0, 2200.0, False,  None,       None),
+        ],
+        runway_availability={"27L": True, "27R": True, "09L": True, "09R": False},
+        sim_time_s=0.0,
+    )
+
+    _swap_cands = enumerate_candidates(_swap_sector)
+    _swap_open  = {r for r, ok in _swap_sector.runway_availability.items() if ok}
+    _occupied   = {"27L"}   # the only runway_needed held by needy aircraft
+
+    # 1. No closed-runway assignment
+    for _c in _swap_cands:
+        if isinstance(_c, AssignRunwayAction):
+            assert _c.runway_id in _swap_sector.runway_availability, \
+                f"Unknown runway {_c.runway_id!r}"
+            assert _swap_sector.runway_availability[_c.runway_id], \
+                f"Closed runway {_c.runway_id!r} in candidate for {_c.aircraft_id}"
+
+    # 2. No duplicate candidates
+    _swap_keys: set[tuple] = set()
+    for _c in _swap_cands:
+        if isinstance(_c, NoAction):
+            _k: tuple = ("NoAction",)
+        elif isinstance(_c, AssignRunwayAction):
+            _k = ("AssignRunwayAction", _c.aircraft_id, _c.runway_id)
+        elif isinstance(_c, HoldAction):
+            _k = ("HoldAction", _c.aircraft_id)
+        elif isinstance(_c, VectorAction):
+            _k = ("VectorAction", _c.aircraft_id, round(_c.new_heading_deg, 1))
+        else:
+            _k = (type(_c).__name__,)
+        assert _k not in _swap_keys, f"Duplicate candidate in swap test: {_k}"
+        _swap_keys.add(_k)
+
+    # 3. Swap step must not redirect EMG002 to an occupied runway via its own
+    #    path (the contested "27L" is in _occupied so it is excluded by the
+    #    `rwy not in occupied` guard; any such candidate came from step 1 only).
+    #    Both EMG001 and EMG002 should have 27R and 09L as options (from step 1).
+    _emg002_rwys = {_c.runway_id for _c in _swap_cands
+                    if isinstance(_c, AssignRunwayAction) and _c.aircraft_id == "EMG002"}
+    assert "09R" not in _emg002_rwys, "Closed runway 09R must never appear"
+    assert _emg002_rwys == {"27L", "27R", "09L"}, (
+        f"EMG002 should have options {{27L, 27R, 09L}}, got {_emg002_rwys}")
+
+    print(f"  EMG002 runway options: {sorted(_emg002_rwys)}")
+    print(f"  {len(_swap_cands)} candidates, 0 duplicates, 0 closed-runway assignments.")
+    print("  All swap assertions passed.")
