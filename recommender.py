@@ -65,6 +65,9 @@ class RewardWeights:
     mayday_bonus:        float = 400.0   # AssignRunway to a MAYDAY aircraft (dominates)
     hold_kt_penalty:     float = 0.08    # per kt·minute of speed reduction
     vector_deg_penalty:  float = 0.8     # per degree of heading deviation
+    divert_nm_penalty:   float = 0.3     # per NM from the aircraft to the assigned runway
+                                         # (prefers the nearest suitable airport; stays
+                                         #  well below breach_penalty so safety dominates)
 
 
 # ===========================================================================
@@ -278,6 +281,16 @@ def compute_reward(
         if target:
             delta = _heading_delta(action.new_heading_deg, target.heading_deg)
             efficiency -= delta * weights.vector_deg_penalty
+    elif isinstance(action, AssignRunwayAction):
+        # Prefer the nearest suitable runway: penalise how far the aircraft must
+        # divert.  Without this, equally-safe runways tie and the first-enumerated
+        # one (list order) wins, sending aircraft to a far airport instead of the
+        # closest one.  Kept small so a breach-eliminating runway still dominates.
+        target  = next((ac for ac in sector.aircraft if ac.id == action.aircraft_id), None)
+        rwy_loc = _RUNWAY_LOCS.get(action.runway_id)
+        if target and rwy_loc:
+            dist_nm = _haversine_m(target.lat, target.lon, *rwy_loc) / _NM_TO_M
+            efficiency -= dist_nm * weights.divert_nm_penalty
 
     return safety + fairness + efficiency
 

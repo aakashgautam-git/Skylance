@@ -23,6 +23,9 @@ Session-state keys
   certificate       Certificate
   counterfactual    Counterfactual | None
   needs_recompute   bool
+  baseline_plan     list[dict] | None  ← landing plan snapshot before emergency
+  current_plan      list[dict] | None  ← landing plan snapshot after SKYLANCE-X replanning
+  baseline_locked   bool               ← True once an emergency has been declared
 """
 
 import math
@@ -32,6 +35,7 @@ import os
 import streamlit as st
 import plotly.graph_objects as go
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "bluesky"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 # ── page config (must come before any other st call) ──────────────────────────
@@ -51,13 +55,30 @@ _RED      = "#f85149"
 _BLUE     = "#58a6ff"
 _TEXT     = "#c9d1d9"
 _MUTED    = "#6e7681"
-_ARROW_LEN = 0.13    # degrees — heading vector length on plot
+
+# Radar-scope palette (professional ATC look) ──────────────────────────────────
+_RADAR_BG   = "#05101e"                  # deep navy paper / plot background
+_RADAR_FACE = "rgba(16,34,58,0.55)"      # scope face — lighter than corners (vignette)
+_RING_COL   = "rgba(99,160,220,0.16)"    # concentric range rings
+_RADIAL_COL = "rgba(99,160,220,0.09)"    # radial bearing lines
+_PLANE_NORM = "#d7dde6"                  # normal aircraft glyph (light grey/white)
 
 _CSS = """
 <style>
-header[data-testid="stHeader"] { display: none; }
+/* Hide the Streamlit toolbar/decoration for a clean look, but keep the header
+   element itself so its sidebar expand control still works. */
+[data-testid="stToolbar"], [data-testid="stDecoration"],
+[data-testid="stStatusWidget"] { display: none; }
+header[data-testid="stHeader"] { background: transparent; box-shadow: none; }
 .block-container { padding-top: 1.2rem; }
-[data-testid="stSidebar"] { border-right: 1px solid #21262d; }
+/* Keep the sidebar (airport/runway controls) always visible — it must never
+   collapse out of reach. */
+section[data-testid="stSidebar"] {
+    transform: none !important;
+    visibility: visible !important;
+    min-width: 244px !important;
+    border-right: 1px solid #21262d;
+}
 [data-testid="stSidebar"] section { padding-top: 0.5rem; }
 div[data-testid="stButton"] button {
     background: #161b22;
@@ -98,6 +119,237 @@ _RUNWAY_AIRPORT = {
 }
 
 
+# ── landing-plan helpers ───────────────────────────────────────────────────────
+
+def _nearest_airport_runway(sector, ac) -> tuple:
+    """Return (icao, runway_id) for the nearest airport with an open runway."""
+    best_icao, best_rwy, best_dist = None, None, float('inf')
+    for icao, ap in _AIRPORTS.items():
+        dist = math.sqrt((ap['lat'] - ac.lat) ** 2 + (ap['lon'] - ac.lon) ** 2)
+        open_rwys = [r for r in ap['runways'] if sector.runway_availability.get(r, False)]
+        if open_rwys and dist < best_dist:
+            best_dist = dist
+            best_icao = icao
+            best_rwy  = open_rwys[0]
+    return best_icao, best_rwy
+
+
+def _bearing_to(lat: float, lon: float, tlat: float, tlon: float) -> float:
+    """Local bearing (deg true, 0–360) from (lat,lon) toward a target point.
+
+    Uses the same flat-earth convention as `_project_position`: heading 0 = north
+    (lat increases), heading 90 = east (lon increases, scaled by cos lat).
+    """
+    de = (tlon - lon) * math.cos(math.radians(lat))   # east displacement, lat-deg equiv
+    dn = (tlat - lat)                                  # north displacement
+    return (math.degrees(math.atan2(de, dn)) + 360.0) % 360.0
+
+
+def _advance_toward(lat: float, lon: float, gs_kt: float,
+                    tlat: float, tlon: float, seconds: float) -> tuple:
+    """
+    Move straight toward a target threshold, clamped so it never overshoots.
+
+    Returns (new_lat, new_lon, new_heading_deg, landed).  Distance to target
+    (in the hypot·60 nm metric used for ETA everywhere) decreases by exactly the
+    step length each call, so ETA is monotonically non-increasing while inbound.
+    """
+    dlat, dlon = tlat - lat, tlon - lon
+    rem_nm  = math.hypot(dlat, dlon) * 60.0
+    step_nm = gs_kt * (seconds / 3600.0)
+    hdg     = _bearing_to(lat, lon, tlat, tlon)
+    if rem_nm <= 1e-6 or step_nm >= rem_nm:
+        return tlat, tlon, hdg, True
+    frac = step_nm / rem_nm
+    return lat + dlat * frac, lon + dlon * frac, hdg, False
+
+
+def _compute_landing_plan(sector, action=None, assignments=None) -> list:
+    """
+    Derive a per-aircraft landing plan from sector state + optional action.
+
+    `assignments` (callsign -> runway_id) is the persistent, locked set of runway
+    assignments the aircraft are actually flying toward; it takes priority so the
+    Before/After table always agrees with the rerouted path drawn on the map.
+
+    Each entry: {callsign, assigned_airport, assigned_runway, eta_min, eta_nm,
+                 sequence_position, is_emergency, emergency_type, is_action_target}
+    """
+    from cascade_engine import AssignRunwayAction
+
+    assignments = assignments or {}
+    action_ac_id = None
+    if isinstance(action, AssignRunwayAction):
+        action_ac_id = action.aircraft_id
+
+    plans = []
+    for ac in sector.aircraft:
+        if ac.id in assignments:
+            rwy = assignments[ac.id]
+            ap  = _RUNWAY_AIRPORT.get(rwy)
+        elif ac.runway_needed and sector.runway_availability.get(ac.runway_needed, False):
+            rwy = ac.runway_needed
+            ap  = _RUNWAY_AIRPORT.get(rwy)
+        else:
+            ap, rwy = _nearest_airport_runway(sector, ac)
+
+        eta_min = eta_nm = None
+        if ap and ap in _AIRPORTS:
+            apd     = _AIRPORTS[ap]
+            eta_nm  = math.sqrt((apd['lat'] - ac.lat) ** 2 + (apd['lon'] - ac.lon) ** 2) * 60
+            eta_min = eta_nm / max(ac.ground_speed_kt, 1) * 60
+
+        plans.append({
+            "callsign":          ac.id,
+            "assigned_airport":  ap,
+            "assigned_runway":   rwy,
+            "eta_min":           eta_min,
+            "eta_nm":            eta_nm,
+            "is_emergency":      ac.emergency_flag,
+            "emergency_type":    ac.emergency_type,
+            "is_action_target":  ac.id == action_ac_id or ac.id in assignments,
+            "sequence_position": 0,   # filled below
+        })
+
+    plans.sort(key=lambda p: (0 if p["is_emergency"] else 1, p["eta_min"] or 999.0))
+    for i, p in enumerate(plans):
+        p["sequence_position"] = i + 1
+    return plans
+
+
+def _resolve_diversions(sector, assignments) -> dict:
+    """
+    Capacity-aware runway allocation around an emergency.
+
+    When an emergency / priority approach claims a runway at airport X, the open
+    runways at X are a finite resource.  Non-emergency aircraft inbound to X fill
+    the remaining runways closest-first; any that no longer fit are DIVERTED to
+    the nearest alternate airport that still has a free runway.
+
+    Returns {callsign: (alt_airport_icao, alt_runway_id)} for diverted aircraft.
+    """
+    by_id     = {a.id: a for a in sector.aircraft}
+    open_rwys = {icao: [r for r in ap['runways']
+                        if sector.runway_availability.get(r, False)]
+                 for icao, ap in _AIRPORTS.items()}
+    used      = {icao: set() for icao in _AIRPORTS}
+
+    # Reserve the runways already locked to assignments; note which airports an
+    # emergency aircraft has taken (those are the ones that get contested).
+    emergency_airports: set[str] = set()
+    for cs, rwy in assignments.items():
+        icao = _RUNWAY_AIRPORT.get(rwy)
+        if not icao:
+            continue
+        used[icao].add(rwy)
+        if by_id.get(cs) and by_id[cs].emergency_flag:
+            emergency_airports.add(icao)
+
+    if not emergency_airports:
+        return {}
+
+    def _dist(ac, icao):
+        ap = _AIRPORTS[icao]
+        return math.hypot(ap['lat'] - ac.lat, ap['lon'] - ac.lon)
+
+    def _nearest_free(ac, exclude):
+        best, best_d = None, float('inf')
+        for icao in _AIRPORTS:
+            if icao in exclude:
+                continue
+            free = [r for r in open_rwys[icao] if r not in used[icao]]
+            if free and _dist(ac, icao) < best_d:
+                best_d, best = _dist(ac, icao), (icao, free[0])
+        return best
+
+    # Non-emergency, unassigned aircraft whose nearest airport is an emergency
+    # airport — they compete for whatever runways remain there.
+    competitors = []
+    for a in sector.aircraft:
+        if a.emergency_flag or a.id in assignments:
+            continue
+        intended, _ = _nearest_airport_runway(sector, a)
+        if intended in emergency_airports:
+            competitors.append((a, intended))
+    competitors.sort(key=lambda t: _dist(t[0], t[1]))   # closest keeps the runway
+
+    diversions = {}
+    for a, intended in competitors:
+        free_here = [r for r in open_rwys[intended] if r not in used[intended]]
+        if free_here:
+            used[intended].add(free_here[0])        # still fits — lands at intended
+            continue
+        alt = _nearest_free(a, exclude={intended})   # runways full — divert away
+        if alt:
+            used[alt[0]].add(alt[1])
+            diversions[a.id] = alt
+    return diversions
+
+
+def _diff_plans(baseline: list, current: list) -> list:
+    """
+    Per-callsign diff between baseline and current landing plans.
+
+    Each entry: {callsign, old_runway, new_runway, old_airport, new_airport,
+                 runway_changed, airport_changed, eta_delta_min, sequence_delta,
+                 old_sequence, new_sequence, old_eta_min, new_eta_min,
+                 status (unchanged|rerouted|resequenced|priority),
+                 is_emergency, emergency_type}
+    """
+    b_map = {p["callsign"]: p for p in baseline}
+    c_map = {p["callsign"]: p for p in current}
+    diffs = []
+
+    for cs in set(b_map) | set(c_map):
+        b = b_map.get(cs)
+        c = c_map.get(cs)
+        if b is None or c is None:
+            continue
+
+        rwy_changed = b["assigned_runway"]  != c["assigned_runway"]
+        ap_changed  = b["assigned_airport"] != c["assigned_airport"]
+        eta_delta   = (
+            round(c["eta_min"] - b["eta_min"], 1)
+            if b["eta_min"] is not None and c["eta_min"] is not None else None
+        )
+        seq_delta = c["sequence_position"] - b["sequence_position"]
+
+        if c.get("is_action_target") and c.get("is_emergency"):
+            status = "priority"
+        elif rwy_changed or ap_changed:
+            status = "rerouted"
+        elif seq_delta != 0:
+            status = "resequenced"
+        else:
+            status = "unchanged"
+
+        diffs.append({
+            "callsign":       cs,
+            "old_runway":     b["assigned_runway"],
+            "new_runway":     c["assigned_runway"],
+            "old_airport":    b["assigned_airport"],
+            "new_airport":    c["assigned_airport"],
+            "runway_changed": rwy_changed,
+            "airport_changed":ap_changed,
+            "eta_delta_min":  eta_delta,
+            "sequence_delta": seq_delta,
+            "old_sequence":   b["sequence_position"],
+            "new_sequence":   c["sequence_position"],
+            "old_eta_min":    b["eta_min"],
+            "new_eta_min":    c["eta_min"],
+            "status":         status,
+            "is_emergency":   c.get("is_emergency", False),
+            "emergency_type": c.get("emergency_type"),
+        })
+
+    diffs.sort(key=lambda d: (
+        0 if d["status"] == "priority" else
+        1 if d["status"] in ("rerouted", "resequenced") else 2,
+        d["new_sequence"] or 99,
+    ))
+    return diffs
+
+
 # ── radar helpers ──────────────────────────────────────────────────────────────
 
 def _project_position(lat: float, lon: float, hdg_deg: float,
@@ -109,23 +361,6 @@ def _project_position(lat: float, lon: float, hdg_deg: float,
     new_lat = lat + dist_nm * math.cos(hdg_rad) / 60.0
     new_lon = lon + dist_nm * math.sin(hdg_rad) / (60.0 * max(math.cos(lat_rad), 1e-9))
     return new_lat, new_lon
-
-
-_LABEL_POS = ['top center', 'bottom center', 'top right', 'bottom left']
-
-def _label_pos_map(aircraft) -> dict[str, str]:
-    """Assign textposition so clustered aircraft labels don't overlap."""
-    # Rank aircraft by (lat, lon) to give each a stable index in the cycle.
-    ranked = sorted(range(len(aircraft)), key=lambda i: (aircraft[i].lat, aircraft[i].lon))
-    rank   = {aircraft[ranked[i]].id: i for i in range(len(ranked))}
-    result = {}
-    for ac in aircraft:
-        crowded = any(
-            abs(ac.lat - o.lat) < 0.5 and abs(ac.lon - o.lon) < 0.5
-            for o in aircraft if o.id != ac.id
-        )
-        result[ac.id] = _LABEL_POS[rank[ac.id] % 4] if crowded else 'top center'
-    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -181,7 +416,14 @@ def _ensure_initialized():
         st.session_state.mode            = "SKYLANCE-X"
         st.session_state.sector_seed     = 42
         st.session_state.n_aircraft      = 10
-        st.session_state.sector          = make_mock_sector(n=10, seed=42)
+        initial_sector = make_mock_sector(n=10, seed=42)
+        st.session_state.sector          = initial_sector
+        st.session_state.baseline_plan   = _compute_landing_plan(initial_sector)
+        st.session_state.current_plan    = None
+        st.session_state.baseline_locked = False
+        st.session_state.assignments     = {}   # callsign -> locked runway flown toward
+        st.session_state.original_paths  = {}   # callsign -> frozen pre-emergency plan
+        st.session_state.diversions      = {}   # callsign -> (alt_airport, alt_runway)
         st.session_state.needs_recompute = True
         st.session_state.initialized     = True
 
@@ -207,11 +449,31 @@ def _recompute():
     bl_action = baseline.recommend(sector)
     bl_score  = engine.evaluate(sector, bl_action)
 
+    # Lock the runway assignment the first time SKYLANCE-X assigns this aircraft,
+    # so it keeps flying toward a FIXED threshold (ETA stays monotonic) and the
+    # map + Before/After table never disagree on the runway.
+    from cascade_engine import AssignRunwayAction
+    assignments = st.session_state.setdefault("assignments", {})
+    diversions  = st.session_state.setdefault("diversions", {})
+    if isinstance(sx_reco.action, AssignRunwayAction):
+        assignments.setdefault(sx_reco.action.aircraft_id, sx_reco.action.runway_id)
+
+    # Capacity-aware diversion: when the emergency fills its airport's runways,
+    # bump the non-emergency flights that no longer fit to the nearest alternate
+    # airport.  Locking them into `assignments` makes them actually fly there
+    # (great-circle propagation) and draw their new route on the map.
+    for cs, (alt_icao, alt_rwy) in _resolve_diversions(sector, assignments).items():
+        if cs not in assignments:
+            assignments[cs] = alt_rwy
+            diversions[cs]  = (alt_icao, alt_rwy)
+
     st.session_state.sx_reco          = sx_reco
     st.session_state.certificate      = cert
     st.session_state.counterfactual   = None   # cleared; request via Explain button
     st.session_state.bl_action        = bl_action
     st.session_state.bl_score         = bl_score
+    st.session_state.current_plan     = _compute_landing_plan(
+        sector, sx_reco.action, assignments)
     st.session_state.needs_recompute  = False
 
 
@@ -239,26 +501,97 @@ def _run_explainer():
 
 def _load_new_sector(seed: int, n: int):
     from state_schema import make_mock_sector
-    st.session_state.sector          = make_mock_sector(n=n, seed=seed)
+    new_sector = make_mock_sector(n=n, seed=seed)
+    st.session_state.sector          = new_sector
+    st.session_state.baseline_plan   = _compute_landing_plan(new_sector)
+    st.session_state.current_plan    = None
+    st.session_state.baseline_locked = False
+    st.session_state.assignments     = {}
+    st.session_state.original_paths  = {}
+    st.session_state.diversions      = {}
     st.session_state.needs_recompute = True
 
 
 def _step_60s():
-    adapter = st.session_state.adapter
-    sector  = st.session_state.sector
-    adapter.load_scenario(sector)
-    adapter.step(60.0)
-    st.session_state.sector          = adapter.get_state()
+    """
+    Advance the sim 60 s with pure-Python dead-reckoning.
+
+    BlueSky is intentionally NOT used here: its `bs.init` is incompatible with
+    this environment (raises 'Traffic' object has no attribute 'groups'), and
+    every other module — cascade engine, recommender — is already pure Python.
+    Assigned aircraft fly straight at their runway threshold (clamped, so ETA
+    decreases every step until touchdown); all others coast on their heading.
+    """
+    from state_schema import AircraftState, SectorState
+    sector      = st.session_state.sector
+    assignments = st.session_state.get("assignments", {})
+    DT_MIN = 1.0   # 60 s
+
+    new_acs = []
+    for ac in sector.aircraft:
+        rwy  = assignments.get(ac.id)
+        icao = _RUNWAY_AIRPORT.get(rwy) if rwy else None
+        ap   = _AIRPORTS.get(icao) if icao else None
+        if ap:   # assigned → converge on the runway threshold
+            nlat, nlon, nhdg, _landed = _advance_toward(
+                ac.lat, ac.lon, ac.ground_speed_kt, ap['lat'], ap['lon'], 60.0)
+        else:    # unassigned → coast along current heading
+            nlat, nlon = _project_position(
+                ac.lat, ac.lon, ac.heading_deg, ac.ground_speed_kt, DT_MIN)
+            nhdg = ac.heading_deg
+        new_fuel = max(0.0, ac.fuel_kg - ac.fuel_burn_rate_kg_per_min * DT_MIN)
+        new_acs.append(AircraftState(
+            id=ac.id, lat=nlat, lon=nlon, altitude_ft=ac.altitude_ft,
+            heading_deg=nhdg, ground_speed_kt=ac.ground_speed_kt,
+            fuel_kg=round(new_fuel, 1),
+            fuel_burn_rate_kg_per_min=ac.fuel_burn_rate_kg_per_min,
+            reserve_fuel_kg=ac.reserve_fuel_kg,
+            emergency_flag=ac.emergency_flag, emergency_type=ac.emergency_type,
+            runway_needed=ac.runway_needed, vertical_speed_fpm=ac.vertical_speed_fpm,
+        ))
+
+    new_sector = SectorState(
+        aircraft=new_acs,
+        runway_availability=dict(sector.runway_availability),
+        sim_time_s=sector.sim_time_s + 60.0,
+        wind_north_kt=sector.wind_north_kt,
+        wind_east_kt=sector.wind_east_kt,
+    )
+    st.session_state.sector = new_sector
+    if not st.session_state.get("baseline_locked", False):
+        st.session_state.baseline_plan = _compute_landing_plan(new_sector)
     st.session_state.needs_recompute = True
 
 
 def _inject_emergency(aircraft_id: str, emg_type: str):
     from state_schema import AircraftState, SectorState
+    st.session_state.baseline_locked = True
     sector = st.session_state.sector
+
+    # Freeze each aircraft's ORIGINAL planned path (BUG 2): its position at the
+    # moment of declaration → its pre-emergency assigned runway threshold.  Drawn
+    # later as the dashed line so the reroute divergence is obvious in a demo.
+    original_paths = st.session_state.setdefault("original_paths", {})
+    b_map = {p["callsign"]: p
+             for p in (st.session_state.get("baseline_plan") or [])}
+    for ac in sector.aircraft:
+        if ac.id in original_paths:
+            continue
+        b = b_map.get(ac.id)
+        if not b or not b.get("assigned_airport"):
+            continue
+        original_paths[ac.id] = {
+            "from_lat": ac.lat, "from_lon": ac.lon,
+            "airport":  b["assigned_airport"],
+            "runway":   b["assigned_runway"],
+        }
 
     def _patch(ac: AircraftState) -> AircraftState:
         if ac.id != aircraft_id:
             return ac
+        # Default the requested runway to the NEAREST open one (not the first in
+        # the dict) so an emergency heads to the closest airport, not Bengaluru.
+        near_rwy = _nearest_airport_runway(sector, ac)[1]
         return AircraftState(
             id=ac.id, lat=ac.lat, lon=ac.lon,
             altitude_ft=ac.altitude_ft, heading_deg=ac.heading_deg,
@@ -268,7 +601,8 @@ def _inject_emergency(aircraft_id: str, emg_type: str):
             reserve_fuel_kg=ac.reserve_fuel_kg,
             emergency_flag=True,
             emergency_type=emg_type,
-            runway_needed=ac.runway_needed or list(sector.runway_availability.keys())[0],
+            runway_needed=(ac.runway_needed or near_rwy
+                           or next(iter(sector.runway_availability), None)),
             vertical_speed_fpm=ac.vertical_speed_fpm,
         )
 
@@ -298,54 +632,124 @@ def _make_radar_fig(sector, active_action=None) -> go.Figure:
     """
     from cascade_engine import AssignRunwayAction, HoldAction, VectorAction
 
+    try:
+        from cascade_engine import _check_separation as _sep_check
+    except Exception:
+        _sep_check = None
+
     fig         = go.Figure()
     annotations = []                 # collected and added via update_layout
-    label_pos   = _label_pos_map(sector.aircraft)
+    shapes      = []                 # static scope furniture (rings, radials, face)
 
-    # ── per-aircraft traces ────────────────────────────────────────────────
+    # ── scope geometry — centre + radius drive the range rings ─────────────
+    all_lats = ([ac.lat for ac in sector.aircraft]
+                + [ap['lat'] for ap in _AIRPORTS.values()])
+    all_lons = ([ac.lon for ac in sector.aircraft]
+                + [ap['lon'] for ap in _AIRPORTS.values()])
+    lon_min, lon_max = min(all_lons) - 1.0, max(all_lons) + 1.0
+    lat_min, lat_max = min(all_lats) - 0.6, max(all_lats) + 0.6
+    cx, cy  = (lon_min + lon_max) / 2, (lat_min + lat_max) / 2
+    ratio   = 1.6   # yaxis scaleratio — also used to keep rings screen-circular
+    scope_r = math.hypot(lon_max - cx, (lat_max - cy) * ratio)
+
+    def _circ(x0, y0, rx, n=56):
+        """Screen-circular ring in data coords (corrects for the y scaleratio)."""
+        return (
+            [x0 + rx * math.cos(2 * math.pi * k / n) for k in range(n + 1)],
+            [y0 + (rx / ratio) * math.sin(2 * math.pi * k / n) for k in range(n + 1)],
+        )
+
+    # ── scope face (vignette) + concentric range rings + bearing spokes ────
+    shapes.append(dict(
+        type='circle', xref='x', yref='y', layer='below',
+        x0=cx - scope_r, x1=cx + scope_r,
+        y0=cy - scope_r / ratio, y1=cy + scope_r / ratio,
+        fillcolor=_RADAR_FACE, line=dict(color='rgba(99,160,220,0.22)', width=1),
+    ))
+    for frac in (0.28, 0.52, 0.76):
+        rr = scope_r * frac
+        shapes.append(dict(
+            type='circle', xref='x', yref='y', layer='below',
+            x0=cx - rr, x1=cx + rr, y0=cy - rr / ratio, y1=cy + rr / ratio,
+            fillcolor='rgba(0,0,0,0)', line=dict(color=_RING_COL, width=1),
+        ))
+    for deg in range(0, 360, 30):
+        a = math.radians(deg)
+        shapes.append(dict(
+            type='line', xref='x', yref='y', layer='below',
+            x0=cx, y0=cy,
+            x1=cx + scope_r * math.cos(a),
+            y1=cy + (scope_r / ratio) * math.sin(a),
+            line=dict(color=_RADIAL_COL, width=1),
+        ))
+
+    # ── conflicting aircraft (geometric ICAO check) drive the alert rings ──
+    conflict_ids: set[str] = set()
+    if _sep_check is not None:
+        try:
+            for b in _sep_check(sector):
+                conflict_ids.add(b.aircraft_id_1)
+                conflict_ids.add(b.aircraft_id_2)
+        except Exception:
+            pass
+
+    _LBL_OFFSETS = [(26, -20), (26, 20), (-26, -20), (-26, 20)]
+    _rank = {ac.id: i for i, ac in enumerate(
+        sorted(sector.aircraft, key=lambda a: (a.lat, a.lon)))}
+
+    # ── per-aircraft rendering ─────────────────────────────────────────────
     for ac in sector.aircraft:
         is_emg  = ac.emergency_flag
         is_crit = ac.is_fuel_critical and not is_emg
 
         if is_emg:
-            dot_col, dot_size, txt_col, txt_sz = _RED,    18, _RED,    12
+            col, glyph_sz, glow = _RED,        25, 'rgba(248,81,73,0.22)'
         elif is_crit:
-            dot_col, dot_size, txt_col, txt_sz = _ORANGE, 14, _ORANGE, 11
+            col, glyph_sz, glow = _ORANGE,     22, 'rgba(227,161,53,0.18)'
         else:
-            frac    = min(1.0, ac.fuel_minutes_above_reserve / 120.0)
-            dot_col = f"rgb({int(80*(1-frac)+20)},{int(180*frac+50)},80)"
-            dot_size, txt_col, txt_sz = 9, '#c9d1d9', 10
+            col, glyph_sz, glow = _PLANE_NORM, 19, 'rgba(205,216,230,0.10)'
 
-        # 5-min projected path (dashed, faint)
+        # Trajectory fan — translucent cone of projected-path uncertainty
+        fc_lat, fc_lon = _project_position(ac.lat, ac.lon, ac.heading_deg,
+                                           ac.ground_speed_kt, 7.0)
+        fl_lat, fl_lon = _project_position(ac.lat, ac.lon, ac.heading_deg - 8.5,
+                                           ac.ground_speed_kt, 7.0)
+        fr_lat, fr_lon = _project_position(ac.lat, ac.lon, ac.heading_deg + 8.5,
+                                           ac.ground_speed_kt, 7.0)
+        fig.add_trace(go.Scatter(
+            x=[ac.lon, fl_lon, fc_lon, fr_lon, ac.lon],
+            y=[ac.lat, fl_lat, fc_lat, fr_lat, ac.lat],
+            mode='lines', fill='toself',
+            fillcolor='rgba(190,200,215,0.06)',
+            line=dict(color='rgba(190,200,215,0.10)', width=0.5),
+            showlegend=False, hoverinfo='skip',
+        ))
+
+        # 5-min projected path (thin leader)
         p_lat, p_lon = _project_position(
             ac.lat, ac.lon, ac.heading_deg, ac.ground_speed_kt, 5.0
         )
         fig.add_trace(go.Scatter(
             x=[ac.lon, p_lon], y=[ac.lat, p_lat],
-            mode='lines',
-            line=dict(color=dot_col, width=1.5, dash='dot'),
-            opacity=0.35, showlegend=False, hoverinfo='skip',
+            mode='lines', line=dict(color=col, width=1.2),
+            opacity=0.5, showlegend=False, hoverinfo='skip',
         ))
 
-        # Emergency pulsing halo
-        if is_emg:
-            fig.add_trace(go.Scatter(
-                x=[ac.lon], y=[ac.lat], mode='markers',
-                marker=dict(size=54, color='rgba(248,81,73,0.10)',
-                            line=dict(color='rgba(248,81,73,0.50)', width=1.5)),
-                showlegend=False, hoverinfo='skip',
-            ))
+        # Conflict / emergency alert rings — nested translucent glow
+        if ac.id in conflict_ids or is_emg:
+            rc = (248, 81, 73) if is_emg else (227, 161, 53)
+            for rr, op in ((scope_r * 0.070, 0.05),
+                           (scope_r * 0.050, 0.09),
+                           (scope_r * 0.032, 0.14)):
+                rx, ry = _circ(ac.lon, ac.lat, rr)
+                fig.add_trace(go.Scatter(
+                    x=rx, y=ry, mode='lines', fill='toself',
+                    fillcolor=f'rgba({rc[0]},{rc[1]},{rc[2]},{op})',
+                    line=dict(color=f'rgba({rc[0]},{rc[1]},{rc[2]},0.35)', width=0.8),
+                    showlegend=False, hoverinfo='skip',
+                ))
 
-        # Heading arrow
-        hdg_rad = math.radians(ac.heading_deg)
-        fig.add_trace(go.Scatter(
-            x=[ac.lon, ac.lon + _ARROW_LEN * math.sin(hdg_rad)],
-            y=[ac.lat, ac.lat + _ARROW_LEN * math.cos(hdg_rad)],
-            mode='lines', line=dict(color=dot_col, width=2),
-            showlegend=False, hoverinfo='skip',
-        ))
-
-        # Main dot + label
+        # Soft glow halo — doubles as the hover target for the aircraft
         emg_line  = f"<br>🚨 <b>{ac.emergency_type}</b>" if is_emg else ""
         crit_line = "  ⚠ FUEL CRITICAL" if is_crit else ""
         hover = (
@@ -357,86 +761,135 @@ def _make_radar_fig(sector, active_action=None) -> go.Figure:
             f"Burn {ac.fuel_burn_rate_kg_per_min:.1f} kg/min<extra></extra>"
         )
         fig.add_trace(go.Scatter(
-            x=[ac.lon], y=[ac.lat],
-            mode='markers+text',
-            marker=dict(size=dot_size, color=dot_col,
-                        line=dict(color='white', width=2.0 if is_emg else 1.2)),
-            text=[ac.id], textposition=label_pos[ac.id],
-            textfont=dict(color=txt_col, size=txt_sz),
-            name=ac.id, hovertemplate=hover, showlegend=False,
+            x=[ac.lon], y=[ac.lat], mode='markers',
+            marker=dict(size=glyph_sz + 12, color=glow, line=dict(width=0)),
+            hovertemplate=hover, showlegend=False,
         ))
 
-    # ── airport markers + two-line annotations ────────────────────────────
+        # Rotated aircraft glyph (✈ points NE by default → offset heading by 45°)
+        annotations.append(dict(
+            x=ac.lon, y=ac.lat, text='✈',
+            showarrow=False, textangle=ac.heading_deg - 45,
+            font=dict(color=col, size=glyph_sz),
+        ))
+
+        # Callsign + ETA tag with a faint leader line back to the aircraft
+        ap_icao, _r = _nearest_airport_runway(sector, ac)
+        eta_txt = ''
+        if ap_icao and ap_icao in _AIRPORTS:
+            apd  = _AIRPORTS[ap_icao]
+            d_nm = math.hypot(apd['lat'] - ac.lat, apd['lon'] - ac.lon) * 60
+            eta_txt = f": {d_nm / max(ac.ground_speed_kt, 1) * 60:.0f} min"
+        ax_off, ay_off = _LBL_OFFSETS[_rank[ac.id] % 4]
+        annotations.append(dict(
+            x=ac.lon, y=ac.lat, text=f"{ac.id}{eta_txt}",
+            showarrow=True, arrowhead=0, arrowwidth=0.7,
+            arrowcolor='rgba(160,180,210,0.40)',
+            ax=ax_off, ay=ay_off,
+            font=dict(color=col, size=9.5),
+            bgcolor='rgba(7,16,30,0.70)',
+            bordercolor='rgba(99,160,220,0.20)', borderwidth=1, borderpad=2,
+            xanchor='left' if ax_off > 0 else 'right',
+        ))
+
+    # ── airport markers (subtle — must not compete with aircraft) ──────────
     for icao, ap in _AIRPORTS.items():
         rwy_str = ', '.join(ap['runways']) if ap['runways'] else '—'
         fig.add_trace(go.Scatter(
             x=[ap['lon']], y=[ap['lat']], mode='markers',
-            marker=dict(size=16, symbol='square', color='#0a1628',
-                        line=dict(color=_BLUE, width=2.5)),
+            marker=dict(size=11, symbol='square', color='rgba(10,22,40,0.9)',
+                        line=dict(color='rgba(88,166,255,0.6)', width=1.5)),
             showlegend=False,
             hovertemplate=(f"<b>{icao}</b>  {ap['city']}, {ap['country']}<br>"
                            f"Runways: {rwy_str}<extra></extra>"),
         ))
         annotations.append(dict(
             x=ap['lon'], y=ap['lat'],
-            text=(f"<b>{icao}</b><br>"
-                  f"<span style='font-size:9px;color:#8b949e'>"
-                  f"{ap['city']} · {ap['country']}</span>"),
-            showarrow=False, yshift=26, xshift=2,
-            bgcolor='rgba(13,17,23,0.88)',
-            bordercolor=_BLUE, borderwidth=1, borderpad=4,
-            font=dict(color=_BLUE, size=11), align='center',
+            text=(f"<span style='color:#7d8fa6;font-size:10px;'>"
+                  f"<b>{icao}</b> · {ap['city']}</span>"),
+            showarrow=False, yshift=15, align='center',
         ))
 
-    # ── action overlay ────────────────────────────────────────────────────
+    # ── reroute paths (BUG 2): original (dashed) + rerouted (solid) ────────
+    # Fully data-driven from the persistent assignment + frozen original-path
+    # snapshot, so BOTH lines stay visible for every reassigned aircraft —
+    # independent of which single action is currently "active".
+    assignments    = st.session_state.get("assignments", {})
+    original_paths = st.session_state.get("original_paths", {})
+    diversions     = st.session_state.get("diversions", {})
+    sector_by_id   = {a.id: a for a in sector.aircraft}
+    has_original_path = False
+    has_reroute       = False
+
+    for cs, rwy_new in assignments.items():
+        ac = sector_by_id.get(cs)
+        if ac is None:
+            continue
+        # Diverted (bumped) flights are drawn amber so the displacement stands out.
+        sev_col = (_RED if ac.emergency_flag
+                   else _ORANGE if (cs in diversions or ac.is_fuel_critical)
+                   else _PLANE_NORM)
+
+        # Original planned path — frozen at declaration (dashed)
+        op = original_paths.get(cs)
+        if op and op.get("airport") in _AIRPORTS:
+            oap = _AIRPORTS[op["airport"]]
+            fig.add_trace(go.Scatter(
+                x=[op["from_lon"], oap['lon']], y=[op["from_lat"], oap['lat']],
+                mode='lines', line=dict(color='#8b949e', width=2, dash='dash'),
+                showlegend=False,
+                hovertemplate=(f"<b>{cs}</b> original plan<br>"
+                               f"→ {op['airport']} RWY {op['runway'] or '?'}"
+                               f"<extra></extra>"),
+            ))
+            has_original_path = True
+
+        # Rerouted path — current position → assigned runway threshold (solid)
+        icao_new = _RUNWAY_AIRPORT.get(rwy_new)
+        nap      = _AIRPORTS.get(icao_new) if icao_new else None
+        if nap:
+            d_nm = math.hypot(nap['lat'] - ac.lat, nap['lon'] - ac.lon) * 60
+            eta  = d_nm / max(ac.ground_speed_kt, 1) * 60
+            fig.add_trace(go.Scatter(
+                x=[ac.lon, nap['lon']], y=[ac.lat, nap['lat']],
+                mode='lines', line=dict(color=sev_col, width=2.5),
+                showlegend=False,
+                hovertemplate=(f"<b>{cs}</b> rerouted<br>"
+                               f"→ {icao_new} RWY {rwy_new}<br>"
+                               f"ETA ≈ {eta:.0f} min · {d_nm:.0f} NM<extra></extra>"),
+            ))
+            has_reroute = True
+
+    # ── action overlay (landing marker + holds + ping-pong animation) ──────
     animated_trace_idx = None
     anim_start = anim_end = (0.0, 0.0)
 
     if isinstance(active_action, AssignRunwayAction):
         tgt_ac  = next((a for a in sector.aircraft
                         if a.id == active_action.aircraft_id), None)
-        ap_icao = _RUNWAY_AIRPORT.get(active_action.runway_id)
-        tgt_ap  = _AIRPORTS.get(ap_icao) if ap_icao else None
+        # Honour the LOCKED assignment so the animation + landing marker target the
+        # exact runway the aircraft is flying toward (map ↔ table agreement).
+        runway_id = assignments.get(active_action.aircraft_id, active_action.runway_id)
+        ap_icao   = _RUNWAY_AIRPORT.get(runway_id)
+        tgt_ap    = _AIRPORTS.get(ap_icao) if ap_icao else None
 
         if tgt_ac and tgt_ap:
             is_mayday = (tgt_ac.emergency_flag
                          and tgt_ac.emergency_type == "MAYDAY")
             approach_col = '#00d4ff' if is_mayday else _ORANGE  # cyan for MAYDAY
 
-            # Previous / original projected path (white dashed — "where it was going")
-            prev_lat, prev_lon = _project_position(
-                tgt_ac.lat, tgt_ac.lon, tgt_ac.heading_deg, tgt_ac.ground_speed_kt, 5.0
-            )
-            fig.add_trace(go.Scatter(
-                x=[tgt_ac.lon, prev_lon], y=[tgt_ac.lat, prev_lat],
-                mode='lines', name='Previous path',
-                line=dict(color='#8b949e', width=2, dash='dash'),
-                showlegend=True, hoverinfo='skip',
-            ))
-
-            # Rerouted approach path (solid, labelled)
             dist_nm = (math.sqrt((tgt_ap['lat'] - tgt_ac.lat)**2
                                  + (tgt_ap['lon'] - tgt_ac.lon)**2) * 60)
             eta_min = dist_nm / max(tgt_ac.ground_speed_kt, 1) * 60
-            fig.add_trace(go.Scatter(
-                x=[tgt_ac.lon, tgt_ap['lon']],
-                y=[tgt_ac.lat, tgt_ap['lat']],
-                mode='lines', name='Approach path',
-                line=dict(color=approach_col, width=2.5),
-                showlegend=True,
-                hovertemplate=(f"<b>{tgt_ac.id}</b> → {ap_icao}<br>"
-                               f"Runway {active_action.runway_id}<br>"
-                               f"ETA ≈ {eta_min:.0f} min<extra></extra>"),
-            ))
 
-            # Landing marker at runway with ETA annotation
+            # Landing marker at the assigned runway with ETA annotation
             fig.add_trace(go.Scatter(
                 x=[tgt_ap['lon']], y=[tgt_ap['lat']], mode='markers',
                 name='Landed',
                 marker=dict(size=14, symbol='star', color=approach_col,
                             line=dict(color='white', width=1.5)),
-                showlegend=True,
-                hovertemplate=(f"<b>{ap_icao}</b> RWY {active_action.runway_id}<br>"
+                showlegend=False,
+                hovertemplate=(f"<b>{ap_icao}</b> RWY {runway_id}<br>"
                                f"{tgt_ac.id} ETA ≈ {eta_min:.0f} min<extra></extra>"),
             ))
             annotations.append(dict(
@@ -448,8 +901,8 @@ def _make_radar_fig(sector, active_action=None) -> go.Figure:
                 bgcolor='rgba(13,17,23,0.85)',
             ))
 
-            # Also show hold orbits and old/new paths with delay labels for non-emergency aircraft
-            # near the airport that are being displaced by the priority approach
+            # Hold orbits + delay labels for non-emergency aircraft displaced
+            # by the priority approach (within 80 NM)
             for other_ac in sector.aircraft:
                 if other_ac.id == tgt_ac.id or other_ac.emergency_flag or other_ac.is_fuel_critical:
                     continue
@@ -459,7 +912,6 @@ def _make_radar_fig(sector, active_action=None) -> go.Figure:
                     r_deg   = 0.06
                     cos_lat = max(math.cos(math.radians(other_ac.lat)), 1e-9)
                     thetas  = [i * 2 * math.pi / 24 for i in range(25)]
-                    # New path (hold orbit)
                     fig.add_trace(go.Scatter(
                         x=[other_ac.lon + r_deg * math.sin(t) / cos_lat for t in thetas],
                         y=[other_ac.lat + r_deg * math.cos(t) for t in thetas],
@@ -467,17 +919,6 @@ def _make_radar_fig(sector, active_action=None) -> go.Figure:
                         line=dict(color=_ORANGE, width=1.5, dash='dot'),
                         showlegend=False, hoverinfo='skip',
                     ))
-                    # Old path (original projected path)
-                    prev_lat, prev_lon = _project_position(
-                        other_ac.lat, other_ac.lon, other_ac.heading_deg, other_ac.ground_speed_kt, 5.0
-                    )
-                    fig.add_trace(go.Scatter(
-                        x=[other_ac.lon, prev_lon], y=[other_ac.lat, prev_lat],
-                        mode='lines',
-                        line=dict(color='#8b949e', width=1.5, dash='dash'),
-                        showlegend=False, hoverinfo='skip',
-                    ))
-                    # Delay label
                     annotations.append(dict(
                         x=other_ac.lon, y=other_ac.lat,
                         text=f"<b>+{eta_min:.0f}m delay</b>",
@@ -487,7 +928,8 @@ def _make_radar_fig(sector, active_action=None) -> go.Figure:
                         bgcolor='rgba(13,17,23,0.85)',
                     ))
 
-            # Animated dot (updated by frames; added last — index is known)
+            # Animated dot pinging along the rerouted approach (frames update
+            # only this trace — see below)
             anim_start = (tgt_ac.lat, tgt_ac.lon)
             anim_end   = (tgt_ap['lat'], tgt_ap['lon'])
             animated_trace_idx = len(fig.data)
@@ -497,7 +939,7 @@ def _make_radar_fig(sector, active_action=None) -> go.Figure:
                             line=dict(color='white', width=2.5)),
                 showlegend=False,
                 hovertemplate=(f"<b>{tgt_ac.id}</b> → {ap_icao}<br>"
-                               f"Runway {active_action.runway_id}<br>"
+                               f"Runway {runway_id}<br>"
                                f"ETA ≈ {eta_min:.0f} min<extra></extra>"),
             ))
 
@@ -569,22 +1011,28 @@ def _make_radar_fig(sector, active_action=None) -> go.Figure:
             font=dict(color=_TEXT, size=11),
         )])
 
-    # ── legend annotation ─────────────────────────────────────────────────
+    # ── legend annotation (restyled for the dark scope) ────────────────────
     path_legend = (
-        "   <span style='color:#e3a135'>━━</span> rerouted path"
-        if has_anim else ""
+        "   <span style='color:#f85149'>━━</span> rerouted path"
+        if has_reroute else ""
+    )
+    orig_legend = (
+        "   <span style='color:#8b949e'>╌╌</span> original plan"
+        if has_original_path else ""
     )
     annotations.append(dict(
         text=(
-            "⬤ <span style='color:#3fb950'>normal</span>"
-            "  ⬤ <span style='color:#e3a135'>critical</span>"
-            "  ⬤ <span style='color:#f85149'>emergency</span>"
-            "  ⬛ airport<br>"
-            "<span style='color:#444'>┄┄</span> 5-min path" + path_legend
+            "✈ <span style='color:#d7dde6'>normal</span>"
+            "  ✈ <span style='color:#e3a135'>critical</span>"
+            "  ✈ <span style='color:#f85149'>emergency</span>"
+            "  ⬛ <span style='color:#7d8fa6'>airport</span><br>"
+            "<span style='color:#5a6b80'>──</span> 5-min path"
+            "   <span style='color:#9aa7b8'>◹</span> trajectory fan"
+            + path_legend + orig_legend
         ),
         xref='paper', yref='paper', x=0.01, y=0.01,
         xanchor='left', yanchor='bottom', showarrow=False,
-        bgcolor='rgba(13,17,23,0.82)', bordercolor='#30363d',
+        bgcolor='rgba(6,14,28,0.85)', bordercolor='rgba(99,160,220,0.25)',
         borderwidth=1, borderpad=5,
         font=dict(color=_TEXT, size=9), align='left',
     ))
@@ -594,37 +1042,33 @@ def _make_radar_fig(sector, active_action=None) -> go.Figure:
         text='1° lat ≈ 60 nm',
         xref='paper', yref='paper', x=0.99, y=0.01,
         xanchor='right', yanchor='bottom', showarrow=False,
-        font=dict(color='#484f58', size=9),
+        font=dict(color='#3f4b5b', size=9),
     ))
 
     # ── layout ────────────────────────────────────────────────────────────
-    all_lats = ([ac.lat for ac in sector.aircraft]
-                + [ap['lat'] for ap in _AIRPORTS.values()])
-    all_lons = ([ac.lon for ac in sector.aircraft]
-                + [ap['lon'] for ap in _AIRPORTS.values()])
-
     fig.update_layout(
         showlegend=False,
-        plot_bgcolor=_BG, paper_bgcolor=_BG,
+        plot_bgcolor=_RADAR_BG, paper_bgcolor=_RADAR_BG,
         height=490,
         margin=dict(l=10, r=10, t=30, b=55 if has_anim else 10),
+        shapes=shapes,
         title=dict(
             text=(f"Sector radar  ·  t = {sector.sim_time_s:.0f} s  "
                   f"·  {len(sector.aircraft)} aircraft"),
             font=dict(color=_TEXT, size=13), x=0.02,
         ),
         xaxis=dict(
-            range=[min(all_lons) - 1.0, max(all_lons) + 1.0],
-            gridcolor=_GRID, tickfont=dict(color=_GREEN),
-            zerolinecolor=_GRID,
-            title=dict(text='Longitude °E', font=dict(color=_GREEN)),
+            range=[lon_min, lon_max],
+            showgrid=False, zeroline=False,
+            tickfont=dict(color='#4d6b8a', size=9),
+            title=dict(text='Longitude °E', font=dict(color='#5f7d9a', size=11)),
         ),
         yaxis=dict(
-            range=[min(all_lats) - 0.6, max(all_lats) + 0.6],
-            gridcolor=_GRID, tickfont=dict(color=_GREEN),
-            zerolinecolor=_GRID,
-            title=dict(text='Latitude °N', font=dict(color=_GREEN)),
-            scaleanchor='x', scaleratio=1.6,
+            range=[lat_min, lat_max],
+            showgrid=False, zeroline=False,
+            tickfont=dict(color='#4d6b8a', size=9),
+            title=dict(text='Latitude °N', font=dict(color='#5f7d9a', size=11)),
+            scaleanchor='x', scaleratio=ratio,
         ),
         annotations=annotations,
     )
@@ -917,9 +1361,41 @@ def _render_decisions_panel():
 </div>
 """, unsafe_allow_html=True)
 
+    # Diverted flights — bumped to a different airport because runways are full
+    diversions     = st.session_state.get("diversions", {})
+    original_paths = st.session_state.get("original_paths", {})
+    div_rows = []
+    for cs, (alt_icao, alt_rwy) in diversions.items():
+        a = next((x for x in sector.aircraft if x.id == cs), None)
+        if a is None:
+            continue
+        alt_ap  = _AIRPORTS.get(alt_icao)
+        eta_div = "—"
+        if alt_ap:
+            dd = math.hypot(alt_ap['lat'] - a.lat, alt_ap['lon'] - a.lon) * 60
+            eta_div = f"{dd / max(a.ground_speed_kt, 1) * 60:.0f} min"
+        from_ap = original_paths.get(cs, {}).get("airport") or ap_icao
+        div_rows.append({
+            "Callsign":    cs,
+            "Was":         from_ap or "—",
+            "Diverted to": f"{alt_icao} · {alt_rwy}",
+            "ETA":         eta_div,
+        })
+
+    if div_rows:
+        st.markdown(
+            f"<div style='font-size:11px;color:{_ORANGE};margin-bottom:6px;'>"
+            f"↪ Diverted Flights — runways full at {ap_icao}</div>",
+            unsafe_allow_html=True,
+        )
+        st.dataframe(div_rows, use_container_width=True, hide_index=True,
+                     height=min(200, 35 + 35 * len(div_rows)))
+
+    # Remaining nearby non-emergency aircraft that still hold/sequence (not diverted)
     affected_rows = []
     for other_ac in sector.aircraft:
-        if other_ac.id == tgt_ac.id or other_ac.emergency_flag or other_ac.is_fuel_critical:
+        if (other_ac.id == tgt_ac.id or other_ac.emergency_flag
+                or other_ac.is_fuel_critical or other_ac.id in diversions):
             continue
         d_nm = (math.sqrt((other_ac.lat - tgt_ap['lat'])**2
                           + (other_ac.lon - tgt_ap['lon'])**2) * 60)
@@ -941,10 +1417,182 @@ def _render_decisions_panel():
             hide_index=True,
             height=min(200, 35 + 35 * len(affected_rows))
         )
-    else:
+    elif not div_rows:
         st.markdown(f"""
 <div style="font-size:11px;color:{_MUTED};margin-bottom:6px;">No other aircraft affected in the approach sector.</div>
 """, unsafe_allow_html=True)
+
+
+def _render_landing_plan_comparison():
+    baseline_plan   = st.session_state.get("baseline_plan")
+    current_plan    = st.session_state.get("current_plan")
+    baseline_locked = st.session_state.get("baseline_locked", False)
+
+    st.markdown(
+        "<div style='font-size:12px;color:#6e7681;margin:14px 0 4px;'>"
+        "Landing Plan Comparison</div>",
+        unsafe_allow_html=True,
+    )
+
+    if not baseline_locked:
+        st.markdown(
+            f"<div style='font-size:12px;color:{_MUTED};padding:8px 12px;"
+            "border:1px solid #30363d;border-radius:4px;'>"
+            "No emergency active — baseline plan only.</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    if baseline_plan is None:
+        st.markdown(
+            f"<div style='font-size:12px;color:{_ORANGE};padding:8px 12px;"
+            f"border:1px solid {_ORANGE};border-radius:4px;'>"
+            "&#9888; Baseline snapshot missing — load a new sector before declaring an emergency.</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    if current_plan is None:
+        st.caption("Computing current plan…")
+        return
+
+    diffs = _diff_plans(baseline_plan, current_plan)
+    b_map = {p["callsign"]: p for p in baseline_plan}
+    c_map = {p["callsign"]: p for p in current_plan}
+
+    def _fmt_eta(eta_min):
+        return f"{eta_min:.1f} min" if eta_min is not None else "—"
+
+    def _row_bg(status):
+        if status == "priority":
+            return f"background:rgba(248,81,73,0.12);border-left:3px solid {_RED};"
+        if status in ("rerouted", "resequenced"):
+            return f"background:rgba(227,161,53,0.10);border-left:3px solid {_ORANGE};"
+        return "border-left:3px solid transparent;"
+
+    th = (f"<th style='padding:4px 6px;font-size:10px;color:{_MUTED};"
+          "text-align:left;font-weight:500;'>")
+
+    def _table(rows_html):
+        return (
+            "<table style='width:100%;border-collapse:collapse;'>"
+            f"<thead><tr>{th}Callsign</th>{th}Airport</th>"
+            f"{th}Runway</th>{th}ETA</th></tr></thead>"
+            f"<tbody>{rows_html}</tbody></table>"
+        )
+
+    # ── Before column ─────────────────────────────────────────────────────────
+    td      = "style='padding:5px 6px;font-size:12px;"
+    td_hdr  = td + "color:#e6edf3;'"
+    td_norm = td + "color:" + _TEXT + ";'"
+
+    before_rows = ""
+    for d in diffs:
+        b = b_map.get(d["callsign"])
+        if not b:
+            continue
+        row_style = _row_bg(d["status"])
+        callsign  = d["callsign"]
+        emg_type  = d.get("emergency_type") or ""
+        badge = ""
+        if d["is_emergency"] and emg_type:
+            badge = (
+                "<span style='font-size:9px;background:" + _RED + ";color:white;"
+                "border-radius:3px;padding:1px 4px;margin-left:4px;'>"
+                + emg_type + "</span>"
+            )
+        b_ap  = b["assigned_airport"] or "—"
+        b_rwy = b["assigned_runway"]  or "—"
+        b_eta = _fmt_eta(b["eta_min"])
+        before_rows += (
+            "<tr style='" + row_style + "'>"
+            "<td " + td_hdr + "><b>" + callsign + "</b>" + badge + "</td>"
+            "<td " + td_norm + ">" + b_ap  + "</td>"
+            "<td " + td_norm + ">" + b_rwy + "</td>"
+            "<td " + td_norm + ">" + b_eta + "</td></tr>"
+        )
+
+    # ── After column ──────────────────────────────────────────────────────────
+    after_rows = ""
+    for d in diffs:
+        c = c_map.get(d["callsign"])
+        if not c:
+            continue
+
+        row_style = _row_bg(d["status"])
+        callsign  = d["callsign"]
+        emg_type  = d.get("emergency_type") or ""
+
+        if d["status"] == "priority":
+            badge = (
+                "<span style='font-size:9px;background:" + _RED + ";color:white;"
+                "border-radius:3px;padding:1px 4px;margin-left:4px;'>PRIORITY</span>"
+            )
+        elif d["is_emergency"] and emg_type:
+            badge = (
+                "<span style='font-size:9px;background:" + _ORANGE + ";color:white;"
+                "border-radius:3px;padding:1px 4px;margin-left:4px;'>"
+                + emg_type + "</span>"
+            )
+        else:
+            badge = ""
+
+        if d["runway_changed"]:
+            old_r = d["old_runway"] or "—"
+            new_r = d["new_runway"] or "—"
+            rwy_cell = (
+                "<span style='color:" + _MUTED + ";text-decoration:line-through;'>"
+                + old_r + "</span> &#8594; "
+                "<b style='color:" + _ORANGE + ";'>" + new_r + "</b>"
+            )
+        else:
+            rwy_cell = c["assigned_runway"] or "—"
+
+        if d["airport_changed"]:
+            old_a = d["old_airport"] or "—"
+            new_a = d["new_airport"] or "—"
+            ap_cell = (
+                "<span style='color:" + _MUTED + ";text-decoration:line-through;'>"
+                + old_a + "</span> &#8594; "
+                "<b style='color:" + _ORANGE + ";'>" + new_a + "</b>"
+            )
+        else:
+            ap_cell = c["assigned_airport"] or "—"
+
+        eta_cell = _fmt_eta(c["eta_min"])
+        delta    = d["eta_delta_min"]
+        if delta is not None and abs(delta) > 0.5:
+            sign      = "+" if delta > 0 else ""
+            delta_col = _RED if delta > 0 else _GREEN
+            delta_str = "{:.1f}".format(delta)
+            eta_cell += (
+                "<span style='font-size:10px;color:" + delta_col + ";"
+                "margin-left:3px;'>(" + sign + delta_str + ")</span>"
+            )
+
+        after_rows += (
+            "<tr style='" + row_style + "'>"
+            "<td " + td_hdr + "><b>" + callsign + "</b>" + badge + "</td>"
+            "<td " + td + "'>" + ap_cell  + "</td>"
+            "<td " + td + "'>" + rwy_cell + "</td>"
+            "<td " + td + "'>" + eta_cell + "</td></tr>"
+        )
+
+    col_b, col_a = st.columns(2)
+    with col_b:
+        st.markdown(
+            f"<div style='font-size:11px;color:{_MUTED};margin-bottom:5px;"
+            "font-weight:500;'>Before emergency</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(_table(before_rows), unsafe_allow_html=True)
+    with col_a:
+        st.markdown(
+            f"<div style='font-size:11px;color:{_MUTED};margin-bottom:5px;"
+            "font-weight:500;'>After SKYLANCE-X decision</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(_table(after_rows), unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1106,6 +1754,7 @@ def main():
         _render_cascade_strip()
         _render_counterfactual()
         _render_decisions_panel()
+        _render_landing_plan_comparison()
 
         st.markdown(
             "<div style='font-size:12px;color:#6e7681;margin:14px 0 4px;'>"
